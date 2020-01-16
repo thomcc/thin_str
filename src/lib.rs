@@ -390,11 +390,11 @@ impl_eq!(&'a ThinStr, str);
 
 #[cfg(feature = "serde_support")]
 mod serde_support {
+    use super::ThinStr;
     use serde::{
         de::{self, Deserialize, Deserializer, Visitor},
         ser::{Serialize, Serializer},
     };
-    use super::ThinStr;
 
     impl<'de> Deserialize<'de> for ThinStr {
         #[inline]
@@ -429,8 +429,14 @@ mod test {
     #[test]
     #[allow(clippy::redundant_clone)]
     fn test_thinness() {
-        assert_eq!(core::mem::size_of::<ThinStr>(), core::mem::size_of::<usize>());
-        assert_eq!(core::mem::size_of::<Option<ThinStr>>(), core::mem::size_of::<usize>());
+        assert_eq!(
+            core::mem::size_of::<ThinStr>(),
+            core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            core::mem::size_of::<Option<ThinStr>>(),
+            core::mem::size_of::<usize>()
+        );
     }
 
     #[test]
