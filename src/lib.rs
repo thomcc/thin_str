@@ -42,15 +42,18 @@ use core::{
 /// ```
 #[repr(transparent)]
 pub struct ThinStr(NonNull<ThinHeader>);
+
 #[repr(C)]
 struct ThinHeader {
     len: usize,
+    // NB: don't actually read from this unless you want to upset miri.
     data: [u8; 0],
 }
 
-// All empty strings point at this. Or something similar -- we want this to be
+// All empty strings point at this. Or a similar header -- we want this to be
 // usable in a const fn, so we can't use `static` and need to assume two copies
-// might be different. This is fine, we just never deallocate if `p.len() == 0`
+// might be different. This is fine, we just never allocate empty strings, and
+// then we can similarly avoid deallocating if `p.len() == 0`.
 const EMPTY_HEADER: ThinHeader = ThinHeader { len: 0, data: [] };
 
 // SAFETY: This is just NonNull::from(&T) but const.
@@ -60,7 +63,6 @@ const EMPTY: ThinStr = unsafe {
     ))
 };
 
-// There's only one owner at a time, so these are safe.
 unsafe impl Send for ThinStr {}
 unsafe impl Sync for ThinStr {}
 
@@ -126,7 +128,7 @@ impl ThinStr {
         }
     }
 
-    /// Create a new string with all-bytes-zero.
+    /// Create a new string with all bytes initialized to zero.
     #[inline]
     pub fn new_zeroed(len: usize) -> Self {
         unsafe { Self::new_init_with(len, |buf| buf.write_bytes(0u8, len)) }
@@ -163,6 +165,7 @@ impl ThinStr {
         alloc::string::String::from(self.as_str())
     }
 
+    // Note: miri hates it if we get this via `data.as_ptr()` :/
     #[inline]
     fn data_ptr(&self) -> *const u8 {
         unsafe { (self.0.as_ptr() as *const u8).add(size_of::<usize>()) }
@@ -173,12 +176,16 @@ impl ThinStr {
         unsafe { (self.0.as_ptr() as *mut u8).add(size_of::<usize>()) }
     }
 
+    /// Access the string's byte array.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         let len = self.len();
         unsafe { core::slice::from_raw_parts(self.data_ptr(), len) }
     }
 
+    /// Get the underlying byte array mutably. It's unsound to write into this
+    /// unless you ensure that it remains valid UTF8 after your writes.
+    ///
     /// # Safety
     /// Caller must not write non-utf8 bytes
     #[inline]
@@ -427,7 +434,6 @@ mod serde_support {
 mod test {
     use super::*;
     #[test]
-    #[allow(clippy::redundant_clone)]
     fn test_thinness() {
         assert_eq!(
             core::mem::size_of::<ThinStr>(),

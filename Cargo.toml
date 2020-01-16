@@ -1,14 +1,17 @@
 [package]
 name = "thin_str"
 version = "0.1.0"
-authors = ["Thom Chiovoloni <tchiovoloni@mozilla.com>"]
+authors = ["Thom Chiovoloni <chiovolonit@gmail.com>"]
 edition = "2018"
-keywords = ["thin", "thin_str", "thinstr", "box", "string", "no_std"]
+keywords = ["thin", "thinstr", "box", "string", "small", "no_std"]
 categories = ["data-structures", "no-std", "rust-patterns"]
 repository = "https://github.com/thomcc/thin_str"
-description = "A thinner `Box<str>` (1 pointer in size)"
+description = "A string type that's smaller than `Box<str>` or String"
 license = "MIT/Apache-2.0"
 readme = "README.md"
+
+[badges]
+circle-ci = { repository = "thomcc/thin_str", branch = "master" }
 
 [features]
 default = []
