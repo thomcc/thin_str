@@ -1,0 +1,90 @@
+version: 2.1
+
+workflows:
+  version: 2
+  test:
+    jobs:
+      - Run tests
+      - Lint and check formatting
+      - Run tests with miri
+  # coverage:
+  #   jobs:
+  #     - Gen Coverage
+
+jobs:
+  Run tests:
+    docker:
+      - image: circleci/rust:1.40.0
+
+    steps:
+      - checkout
+      - run:
+          name: Version information
+          command: rustc --version; cargo --version; rustup --version
+      - run:
+          name: Test
+          command: cargo test --verbose
+      - run:
+          name: Test --all-features
+          command: cargo test --all-features --verbose
+
+  Lint and check formatting:
+    docker:
+      - image: circleci/rust:latest
+    steps:
+      - checkout
+      - run: rustup component add clippy rustfmt
+      - run: cargo fmt -- --version
+      - run: cargo fmt -- --check
+      - run: cargo clippy -- --version
+      - run: cargo clippy -- -D warnings
+
+  Run tests with miri:
+    docker:
+      - image: circleci/rust:latest
+
+    steps:
+      - checkout
+      - run:
+          name: Install miri
+          command: |
+              MIRI_NIGHTLY=nightly-$(curl -s https://rust-lang.github.io/rustup-components-history/x86_64-unknown-linux-gnu/miri)
+              echo "Installing latest nightly with Miri: $MIRI_NIGHTLY"
+              rustup default "$MIRI_NIGHTLY"
+              rustup component add miri
+              cargo clean
+      - run:
+          name: Miri test
+          command: cargo miri test --verbose
+      - run:
+          name: Miri test --all-features
+          command: cargo miri test --all-features --verbose
+
+  # Gen Coverage:
+  #   machine: true
+  #   steps:
+  #     - checkout
+  #     - run:
+  #         name: Download rustup
+  #         command: |
+  #           wget https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+  #           chmod +x rustup-init
+  #     - run:
+  #         name: Install Rust
+  #         command: |
+  #           ./rustup-init -y --no-modify-path
+  #           rm rustup-init
+  #           echo 'export PATH=$HOME/.cargo/bin:$PATH' >> $BASH_ENV
+  #     - run: sudo apt-get update
+  #     - run: sudo apt-get install libssl-dev pkg-config cmake zlib1g-dev
+  #     - run:
+  #         name: Install Tarpaulin
+  #         command: cargo install cargo-tarpaulin
+  #         environment:
+  #           RUSTFLAGS: --cfg procmacro2_semver_exempt
+  #     - run:
+  #         name: Generate coverage report
+  #         command: cargo tarpaulin --out Xml --all-features
+  #     - run:
+  #         name: Upload to codecov.io
+  #         command: bash <(curl -s https://codecov.io/bash) -Z -f cobertura.xml
