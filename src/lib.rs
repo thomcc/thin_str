@@ -22,7 +22,10 @@
 //! - `serde_support`: Support serializing and deserializing `ThinStr` using
 //!   `serde`. Disabled by default.
 extern crate alloc;
-use alloc::alloc::{alloc, dealloc, handle_alloc_error, Layout};
+use alloc::alloc::{alloc, realloc, dealloc, handle_alloc_error, Layout};
+
+#[doc(hidden)]
+pub use core as __core;
 
 use core::{
     mem::{align_of, size_of},
@@ -95,7 +98,8 @@ impl ThinStr {
     }
 
     /// SAFETY: `initializer` must initialize the first `len` bytes of the
-    /// pointer with UTF-8.
+    /// pointer with UTF-8. The pointer passed in will not be null, and will be
+    /// fresh from the allocator.
     #[inline]
     unsafe fn new_init_with(len: usize, initializer: impl FnOnce(*mut u8)) -> Self {
         if len == 0 {
@@ -120,6 +124,8 @@ impl ThinStr {
     /// Create a new string with the same contents as `s`.
     #[inline]
     pub fn new(s: &str) -> Self {
+        // SAFETY: we're required to initialize the first `len` bytes in the
+        // callback, and we do with copy_nonoverlapping.
         unsafe {
             let len = s.len();
             Self::new_init_with(len, |buf| {
@@ -131,17 +137,131 @@ impl ThinStr {
     /// Create a new string with all bytes initialized to zero.
     #[inline]
     pub fn new_zeroed(len: usize) -> Self {
+        // SAFETY: we're required to initialize the first `len` bytes in the
+        // callback, and we do with write_bytes.
         unsafe { Self::new_init_with(len, |buf| buf.write_bytes(0u8, len)) }
     }
+
+    /// Add space for exactly `additional` extra bytes, which will be
+    /// initialized by `initializer`.
+    ///
+    /// SAFETY: `initializer` must must initialize the first `additional_len` of
+    /// the pointer it is passed bytes before returning. Note: It may not read from
+    /// `self` or any value derived from it (the borrow checker prevents this,
+    /// but it's unsound to do it with unsafe code too).
+    unsafe fn grow_init_with(&mut self, additional_len: usize, initializer: impl FnOnce(*mut u8)) {
+        if additional_len == 0 {
+            return;
+        }
+
+        let old_len = self.len();
+
+        if old_len == 0 {
+            // If we're empty, this is just `new_init_with`.
+            *self = Self::new_init_with(additional_len, initializer);
+            return;
+        }
+
+        let old_layout = Self::layout_for(old_len);
+        let new_len = old_len.checked_add(additional_len).unwrap();
+
+        let new_header: NonNull<ThinHeader> = self.reallocate(old_layout, new_len);
+
+        let str_start = new_header.as_ptr().add(1).cast::<u8>();
+        let uninit_start = str_start.add(old_len);
+
+        initializer(uninit_start);
+        // Now that everything is initialized, go back to being a non-empty string.
+        self.0 = new_header;
+    }
+
+    unsafe fn shrink_to(&mut self, new_len: usize) {
+        debug_assert!(self.as_str().get(..new_len).is_some());
+
+        let layout = Self::layout_for(self.len());
+
+        let realloced: NonNull<ThinHeader> = self.reallocate(layout, new_len);
+        self.0 = realloced;
+    }
+
+    /// Invoke realloc with our header, `old` and `new_len`. Updates the `len`
+    /// of the resulting header and returns it. Aborts if the alloc fails, and
+    /// leaves us temproarially empty if not. Unsafe for most of the same
+    /// reasons as `realloc`.
+    #[inline]
+    unsafe fn reallocate(&mut self, old: Layout, new_len: usize) -> NonNull<ThinHeader> {
+        debug_assert!(!self.is_empty() && new_len != 0);
+        let new = Self::layout_for(new_len);
+        let thin_header = self.take_raw();
+
+        let realloced = realloc(thin_header.as_ptr().cast(), old, new.size()).cast();
+        let result: NonNull<ThinHeader> = NonNull::new(realloced).unwrap_or_else(|| {
+            handle_alloc_error(new)
+        });
+        (*result.as_ptr()).len = new_len;
+        result
+    }
+
+    /// Return our header pointer, leaving us EMPTY. Used to defend against
+    /// problems in the case of unexpected panics in unsafe code.
+    #[inline]
+    fn take_raw(&mut self) -> NonNull<ThinHeader> {
+        core::mem::replace(self, EMPTY).into_raw()
+    }
+
+    #[inline]
+    fn into_raw(self) -> NonNull<ThinHeader> {
+        let p = self.0;
+        core::mem::forget(self);
+        p
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        *self = EMPTY;
+    }
+
+    #[inline]
+    pub fn truncate(&mut self, l: usize) {
+        if self.len() <= l {
+            return;
+        } else if l == 0 {
+            self.clear();
+            return;
+        }
+        assert!(self.as_str().get(..l).is_some());
+        unsafe {
+            self.shrink_to(l);
+        }
+    }
+
+    // The obvious way of implementing formatting is pretty slow on macos...
+    // In principal this shouldn't be that bad though, and we may want it in the future.
+    /*
+    #[inline]
+    pub fn push_str(&mut self, s: &str) {
+        unsafe {
+            // Safe because we initialize `len` bytes of `buf` and do not read
+            // from pointers that came from `self` inside the closure.
+            let len = s.len();
+            self.grow_init_with(len, |buf| {
+                ptr::copy_nonoverlapping(s.as_bytes().as_ptr(), buf, len)
+            })
+        }
+    }*/
 
     #[inline]
     fn layout_for(len: usize) -> Layout {
         assert!(len != 0);
-        Layout::from_size_align(
-            size_of::<ThinHeader>().checked_add(len).unwrap(),
-            align_of::<ThinHeader>(),
-        )
-        .unwrap()
+        let size = size_of::<ThinHeader>().checked_add(len).unwrap();
+        Self::raw_size_to_layout(size)
+    }
+
+    #[inline]
+    fn raw_size_to_layout(size: usize) -> Layout {
+        let align = align_of::<ThinHeader>();
+        assert!(size.saturating_add(align) < isize::max_value() as usize);
+        Layout::from_size_align(size, align).unwrap()
     }
 
     /// How long is the string, in bytes.
@@ -214,6 +334,73 @@ impl ThinStr {
             assert!(core::str::from_utf8(bytes).is_ok());
         }
         unsafe { core::str::from_utf8_unchecked(bytes) }
+    }
+
+    #[inline]
+    fn append_zeros(&mut self, count: usize) {
+        unsafe {
+            // Safe because we initialize `count` bytes of `buf` and do not read
+            // from pointers that came from `self` (or anything like that)
+            // inside the closure.
+            self.grow_init_with(count, |buf| buf.write_bytes(0u8, count))
+        }
+    }
+}
+#[doc(hidden)]
+pub struct WriteHelper<'a> {
+    pos: usize,
+    buf: &'a mut ThinStr,
+}
+
+impl<'a> WriteHelper<'a> {
+    #[inline]
+    #[doc(hidden)]
+    pub fn new(buf: &'a mut ThinStr) -> Self {
+        Self { pos: buf.len(), buf }
+    }
+
+    fn ensure_cap(&mut self, cap: usize) {
+        let grow_to = self.buf.len()
+            .max(8)
+            .checked_mul(2)
+            .unwrap()
+            .max(cap);
+        let need = grow_to - self.buf.len();
+        self.buf.append_zeros(need);
+    }
+
+    #[inline]
+    fn append(&mut self, s: &str) {
+        let need = self.pos + s.len();
+        if need > self.buf.len() {
+            self.ensure_cap(need);
+        }
+
+        debug_assert!(self.buf.is_char_boundary(self.pos) && self.buf.is_char_boundary(need));
+        // SAFETY: appending valid utf8 to other valid utf8 still results in
+        // valid utf8. Additionally, we know the bytes past `self.pos` are
+        // zeroed, which means we cannot create an invalid sequence by
+        // overwriting part of a valid one that exists in that area.
+        unsafe {
+            let buf = &mut self.buf.as_mut_bytes()[self.pos..need];
+            buf.copy_from_slice(s.as_bytes());
+        }
+        self.pos = need;
+    }
+}
+
+impl<'a> Drop for WriteHelper<'a> {
+    #[inline]
+    fn drop(&mut self) {
+        self.buf.truncate(self.pos);
+    }
+}
+
+impl<'a> core::fmt::Write for WriteHelper<'a> {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.append(s);
+        Ok(())
     }
 }
 
@@ -391,9 +578,31 @@ macro_rules! impl_eq {
         }
     };
 }
+
 impl_eq!(ThinStr, str);
 impl_eq!(ThinStr, &'a str);
 impl_eq!(&'a ThinStr, str);
+
+impl_eq!(ThinStr, alloc::string::String);
+impl_eq!(&'a ThinStr, alloc::string::String);
+
+impl_eq!(ThinStr, &'a alloc::string::String);
+
+#[macro_export]
+macro_rules! thin_format {
+    ($s:literal $(,)?) => {
+        $crate::ThinStr::new($s)
+    };
+    ($fmt:literal, $($arg:tt)+) => {{
+        let mut ts = $crate::ThinStr::empty();
+        {
+            use $crate::__core::fmt::Write as _;
+            let mut writer = $crate::WriteHelper::new(&mut ts);
+            $crate::__core::write!(&mut writer, $fmt, $($arg)+).unwrap();
+        }
+        ts
+    }};
+}
 
 #[cfg(feature = "serde_support")]
 mod serde_support {
@@ -510,6 +719,17 @@ mod test {
         let mut t = ThinStr::empty();
         t.make_ascii_uppercase();
         assert_eq!(t, "");
+    }
+
+    #[test]
+    fn test_thin_format() {
+        assert_eq!(thin_format!("foobar"), "foobar");
+        assert_eq!(thin_format!("foobar{}", 123), "foobar123");
+        let s = thin_format!("{}, {:?}, {}", 123, "abcdefghijklmnop", 456);
+        assert_eq!(s, "123, \"abcdefghijklmnop\", 456");
+        let big = thin_format!("{}|{}|{}|{}", s, s, s, s);
+        let expected = [s.as_str(), s.as_str(), s.as_str(), s.as_str()].join("|");
+        assert_eq!(expected, big);
     }
 
     #[test]
